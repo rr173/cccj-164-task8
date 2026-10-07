@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>配额灾备异常告警路由器</title>
+<style>
+  :root {
+    --bg:#0f172a; --panel:#1e293b; --panel2:#273449; --line:#334155;
+    --text:#e2e8f0; --muted:#94a3b8;
+    --firing:#ef4444; --acked:#f59e0b; --silenced:#8b5cf6;
+    --resolved:#22c55e; --closed:#64748b; --pending:#38bdf8;
+    --accent:#38bdf8;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font:13px/1.5 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+         background:var(--bg); color:var(--text); }
+  header { padding:12px 20px; background:var(--panel); border-bottom:1px solid var(--line);
+           display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+  header h1 { font-size:16px; margin:0; }
+  .stat { display:flex; gap:6px; align-items:baseline; }
+  .stat b { font-size:18px; }
+  .stat span { color:var(--muted); font-size:12px; }
+  main { padding:16px 20px; display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  .card h2 { margin:0; padding:10px 14px; font-size:13px; background:var(--panel2);
+             border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; }
+  .card .body { padding:10px 14px; max-height:340px; overflow:auto; }
+  .wide { grid-column:1 / -1; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th,td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; position:sticky; top:0; background:var(--panel); }
+  tr:hover td { background:rgba(56,189,248,.06); }
+  .badge { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11px; font-weight:600; }
+  .s-FIRING { background:rgba(239,68,68,.18); color:#fca5a5; }
+  .s-ACKED { background:rgba(245,158,11,.18); color:#fcd34d; }
+  .s-SILENCED { background:rgba(139,92,246,.18); color:#c4b5fd; }
+  .s-RESOLVED { background:rgba(34,197,94,.18); color:#86efac; }
+  .s-CLOSED { background:rgba(100,116,139,.25); color:#cbd5e1; }
+  .s-PENDING,.s-OPEN,.s-WITNESSED { background:rgba(56,189,248,.18); color:#7dd3fc; }
+  .s-BORN_CLOSED,.s-CLOSED-chain { background:rgba(100,116,139,.25); color:#cbd5e1; }
+  button,select,input,textarea { font:inherit; }
+  button { background:var(--panel2); color:var(--text); border:1px solid var(--line);
+           border-radius:6px; padding:3px 10px; cursor:pointer; }
+  button:hover { border-color:var(--accent); color:#fff; }
+  button.primary { background:#0369a1; border-color:#0284c7; }
+  button.danger { background:#7f1d1d; border-color:#b91c1c; }
+  button:disabled { opacity:.4; cursor:default; }
+  .row-actions { display:flex; gap:5px; flex-wrap:wrap; }
+  input,select,textarea { background:#0b1220; color:var(--text); border:1px solid var(--line);
+           border-radius:6px; padding:4px 8px; }
+  label { color:var(--muted); display:flex; flex-direction:column; gap:3px; font-size:11px; }
+  .grid3 { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; }
+  pre { white-space:pre-wrap; word-break:break-all; margin:0; font-size:11px; color:#cbd5e1;
+        max-height:120px; overflow:auto; }
+  .muted { color:var(--muted); }
+  .ok { color:#86efac; } .bad { color:#fca5a5; }
+  .kind { font-family:ui-monospace,monospace; color:#7dd3fc; }
+  .toast { position:fixed; right:18px; bottom:18px; background:#064e3b; border:1px solid #10b981;
+           color:#d1fae5; padding:10px 14px; border-radius:8px; opacity:0; transition:opacity .3s;
+           max-width:380px; z-index:50; }
+  .toast.err { background:#7f1d1d; border-color:#ef4444; color:#fee2e2; }
+  .toast.show { opacity:1; }
+  .toggle-auto { font-size:11px; color:var(--muted); display:flex; align-items:center; gap:5px; }
+  details summary { cursor:pointer; color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>🚨 配额灾备异常告警路由器</h1>
+  <div class="stat"><b id="st-active">-</b><span>活动</span></div>
+  <div class="stat"><b id="st-firing">-</b><span>触发</span></div>
+  <div class="stat"><b id="st-acked">-</b><span>已确认</span></div>
+  <div class="stat"><b id="st-silenced">-</b><span>静默</span></div>
+  <div class="stat"><b id="st-gaps">-</b><span>开放缺口</span></div>
+  <div class="stat"><b id="st-rules">-</b><span>静默规则</span></div>
+  <span class="muted" id="st-sub"></span>
+  <span style="flex:1"></span>
+  <label class="toggle-auto"><input type="checkbox" id="auto" checked> 3 秒自动刷新</label>
+  <button onclick="pollOnce()">立即订阅一轮</button>
+  <button onclick="sweep()">Sweep</button>
+  <button class="primary" onclick="loadAll()">刷新</button>
+</header>
+
+<main>
+  <section class="card wide">
+    <h2>告警（按租户 + 类型聚合）
+      <span>
+        <select id="f-status" onchange="loadAlerts()">
+          <option value="">全部状态</option>
+          <option value="FIRING" selected>FIRING</option>
+          <option value="ACKED">ACKED</option>
+          <option value="SILENCED">SILENCED</option>
+          <option value="RESOLVED">RESOLVED</option>
+          <option value="CLOSED">CLOSED</option>
+        </select>
+      </span>
+    </h2>
+    <div class="body">
+      <table>
+        <thead><tr><th>ID</th><th>租户</th><th>类型</th><th>状态</th><th>次数</th>
+          <th>最近原因</th><th>更新时间</th><th>操作</th></tr></thead>
+        <tbody id="alerts"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card wide">
+    <h2>事件模拟 / 接入（POST /api/events，event_id 幂等）</h2>
+    <div class="body">
+      <div class="grid3">
+        <label>event_id <input id="ev-id"></label>
+        <label>tenant <input id="ev-tenant" value="tenant-a"></label>
+        <label>seq（留空自动分配；制造缺口可跳号）<input id="ev-seq" type="number" min="1"></label>
+        <label>chain_id <input id="ev-chain" value="chain-demo-1"></label>
+        <label>event_type
+          <select id="ev-type">
+            <option>ISOLATION</option><option>GAP</option>
+            <option>TAKEOVER</option><option>AUDIT</option>
+          </select></label>
+        <label>role
+          <select id="ev-role"><option>BEGIN</option><option>END</option><option>WITNESS</option></select></label>
+        <label>reason <input id="ev-reason" value="LAG_OVER_LIMIT"></label>
+        <label>audit_ref（AUDIT 必填）<input id="ev-ref" value="audit-1"></label>
+      </div>
+      <p class="muted" style="margin:8px 0 4px">
+        快捷剧本：
+        <button onclick="scenario('iso-complete')">完整隔离链(BEGIN+WITNESS)</button>
+        <button onclick="scenario('iso-gap-then-fill')">缺审计→补齐→END恢复</button>
+        <button onclick="scenario('takeover')">完整接管链(BEGIN+END+WITNESS)</button>
+        <button onclick="scenario('watermark-gap')">水位跳号缺口→补齐</button>
+        <button onclick="scenario('dedup')">滑动窗口去重连发</button>
+      </p>
+      <div class="row-actions">
+        <button class="primary" onclick="sendEvent()">发送事件</button>
+        <button onclick="fillTemplate()">填充表单</button>
+        <span id="ev-result" class="muted"></span>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>连续水位（每租户）</h2>
+    <div class="body"><table><thead><tr><th>租户</th><th>连续水位</th>
+      <th>最大序号</th><th>待应用</th><th>连续性</th></tr></thead>
+      <tbody id="watermarks"></tbody></table></div>
+  </section>
+
+  <section class="card">
+    <h2>水位缺口</h2>
+    <div class="body"><table><thead><tr><th>租户</th><th>缺失序号</th>
+      <th>检测时间</th><th>补齐时间</th></tr></thead>
+      <tbody id="gaps"></tbody></table></div>
+  </section>
+
+  <section class="card wide">
+    <h2>静默规则</h2>
+    <div class="body">
+      <div class="grid3" style="margin-bottom:8px">
+        <label>tenant <input id="sl-tenant" value="tenant-a"></label>
+        <label>alert_type（空=全部）
+          <select id="sl-type"><option value="">*</option>
+            <option>ISOLATION</option><option>GAP</option><option>TAKEOVER</option></select></label>
+        <label>reason（空=通配）<input id="sl-reason"></label>
+        <label>ttl 秒（空=永久）<input id="sl-ttl" type="number" min="1" value="60"></label>
+        <label>备注<input id="sl-note" value="维护窗口"></label>
+        <label style="justify-content:flex-end">
+          <button class="primary" onclick="createSilence()">创建规则（并静默既有 FIRING）</button></label>
+      </div>
+      <table><thead><tr><th>ID</th><th>租户</th><th>类型</th><th>原因</th>
+        <th>到期</th><th>备注</th><th></th></tr></thead>
+        <tbody id="silences"></tbody></table>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>事件链</h2>
+    <div class="body"><table><thead><tr><th>chain_id</th><th>租户</th><th>类型</th>
+      <th>状态</th><th>角色 B/E/W</th><th>告警</th></tr></thead>
+      <tbody id="chains"></tbody></table></div>
+  </section>
+
+  <section class="card">
+    <h2>审计轨迹（每次状态转移一条）</h2>
+    <div class="body"><table><thead><tr><th>id</th><th>时间</th><th>kind</th>
+      <th>明细</th></tr></thead><tbody id="audit"></tbody></table></div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+function fmt(ts) { return ts ? new Date(ts*1000).toLocaleTimeString('zh-CN') : '—'; }
+function esc(s){ return String(s ?? '').replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function toast(msg, isErr){ const t=$('toast'); t.textContent=msg; t.className='toast show'+(isErr?' err':'');
+  setTimeout(()=>t.className='toast', 3500); }
+
+async function api(path, opts){
+  const r = await fetch(path, opts);
+  const data = await r.json().catch(()=>({}));
+  if(!r.ok) throw Object.assign(new Error(data.message||r.statusText), {data});
+  return data;
+}
+const jpost = (p,b)=>api(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});
+const jdel = p=>api(p,{method:'DELETE'});
+
+async function loadStatus(){
+  const s = await api('/ops/status');
+  const by = s.alerts.by_status || {};
+  $('st-active').textContent = s.alerts.active;
+  $('st-firing').textContent = by.FIRING||0;
+  $('st-acked').textContent = by.ACKED||0;
+  $('st-silenced').textContent = by.SILENCED||0;
+  $('st-gaps').textContent = s.open_gaps;
+  $('st-rules').textContent = s.active_silence_rules;
+  const sub = s.subscriber || {};
+  $('st-sub').textContent = sub.enabled === false
+    ? '直连模式（无订阅器）'
+    : `订阅游标 ${sub.audit_cursor ?? '-'}${sub.running?' · 运行中':' · 已停'}${sub.last_error?(' · '+sub.last_error):''}`;
+}
+
+async function loadAlerts(){
+  const st = $('f-status').value;
+  const url = '/api/alerts?limit=100' + (st?('&status='+st):'');
+  const {alerts} = await api(url);
+  $('alerts').innerHTML = alerts.map(a=>{
+    const active = ['FIRING','ACKED','SILENCED'].includes(a.status);
+    const acts = active ? `
+      <div class="row-actions">
+        ${a.status!=='ACKED'&&a.status!=='SILENCED'?`<button onclick="act('${a.id}','ack')">确认</button>`:''}
+        ${a.status==='ACKED'?`<button onclick="act('${a.id}','unack')">取消确认</button>`:''}
+        ${a.status!=='SILENCED'?`<button onclick="silenceOne('${a.id}')">静默60s</button>`
+                             :`<button onclick="unsilenceOne('${a.id}')">解除静默</button>`}
+        <button class="danger" onclick="resolve('${a.id}')">恢复</button>
+      </div>` : '<span class="muted">终态</span>';
+    return `<tr>
+      <td><a href="#" onclick="showAlert('${a.id}');return false">${a.id}</a></td>
+      <td>${esc(a.tenant)}</td><td>${a.alert_type}</td>
+      <td><span class="badge s-${a.status}">${a.status}</span></td>
+      <td>${a.occurrence_count}</td><td>${esc(a.last_reason)}</td>
+      <td>${fmt(a.updated_at)}</td><td>${acts}</td></tr>`;
+  }).join('') || '<tr><td colspan="8" class="muted">无</td></tr>';
+}
+
+async function showAlert(id){
+  const a = await api('/api/alerts/'+id);
+  alert(`告警 ${a.id}\n状态: ${a.status}\n摘要: ${a.summary}\n发生次数: ${a.occurrence_count}\n\n链:\n`
+    + (a.chains||[]).map(c=>`- ${c.chain_id} ${c.status} B=${c.saw_begin} E=${c.saw_end} W=${c.witnesses}`).join('\n')
+    + '\n\n发生:\n' + (a.occurrences||[]).map(o=>`- seq ${o.seinSeq(o.seq)} ${o.reason} notified=${o.notified}`).join('\n'));
+}
+function seinSeq(s){ return s==null?'auto':s; }
+
+async function act(id, action){
+  try { await jpost(`/api/alerts/${id}/${action}`, {by:'ops-page'}); toast(action+' 成功'); loadAll(); }
+  catch(e){ toast(e.message, true); }
+}
+async function silenceOne(id){
+  try { await jpost(`/api/alerts/${id}/silence`, {ttl_seconds:60, by:'ops-page'}); toast('已静默 60s'); loadAll(); }
+  catch(e){ toast(e.message, true); }
+}
+async function unsilenceOne(id){
+  try { await jpost(`/api/alerts/${id}/unsilence`, {delete_rule:true, by:'ops-page'}); toast('已解除静默'); loadAll(); }
+  catch(e){ toast(e.message, true); }
+}
+async function resolve(id){
+  try { await jpost(`/api/alerts/${id}/resolve`, {by:'ops-page', note:'页面人工恢复'}); toast('已恢复/关闭'); loadAll(); }
+  catch(e){ toast(e.message, true); }
+}
+
+function currentEvent(){
+  return {
+    event_id: $('ev-id').value || ('ev-'+Math.random().toString(16).slice(2,10)),
+    tenant: $('ev-tenant').value,
+    event_type: $('ev-type').value,
+    role: $('ev-type').value==='AUDIT' ? 'WITNESS' : $('ev-role').value,
+    chain_id: $('ev-chain').value,
+    reason: $('ev-reason').value,
+    audit_ref: $('ev-type').value==='AUDIT' ? ($('ev-ref').value || 'audit-x') : undefined,
+    seq: $('ev-seq').value ? Number($('ev-seq').value) : undefined,
+  };
+}
+function fillTemplate(){
+  const e = currentEvent(); $('ev-id').value = e.event_id;
+}
+async function sendEvent(){
+  fillTemplate();
+  try {
+    const r = await jpost('/api/events', currentEvent());
+    $('ev-result').textContent = JSON.stringify(r);
+    toast('事件已接收 seq='+r.seq+(r.duplicate?'（重复幂等）':''));
+    loadAll();
+  } catch(e){ toast(e.message, true); }
+}
+
+// ---------------- 剧本 ----------------
+let scenarioSeq = 0;
+function base(chain, type, role, seq, reason, ref){
+  scenarioSeq++;
+  return {event_id:`scn-${chain}-${role}-${scenarioSeq}`, tenant:'tenant-a',
+    event_type: type==='AUDIT'?'AUDIT':type, role: type==='AUDIT'?'WITNESS':role,
+    chain_id:'scn-'+chain, reason: reason||'', seq: seq||undefined,
+    audit_ref: ref||undefined};
+}
+async function postBatch(events){
+  try { const r = await jpost('/api/events/batch', {events});
+    toast(`已发送 ${events.length} 条事件`); loadAll(); return r; }
+  catch(e){ toast(e.message, true); }
+}
+function scenario(name){
+  const t = Date.now().toString(36);
+  if(name==='iso-complete'){
+    $('ev-chain').value='scn-'+t;
+    return postBatch([base(t,'ISOLATION','BEGIN',undefined,'LAG_OVER_LIMIT'),
+      base(t,'AUDIT',undefined,undefined,'LAG_OVER_LIMIT','a1')]);
+  }
+  if(name==='iso-gap-then-fill'){
+    // seq1=BEGIN 到达；seq2（WITNESS）缺失后用 seq3 END 制造缺口场景：
+    // 先只发 BEGIN，再发 END（连续水位允许），链因缺 WITNESS 不触发；
+    // 随后补发 WITNESS——补齐时链已 CLOSED → BORN_CLOSED 不补发。
+    $('ev-chain').value='scn-'+t;
+    return postBatch([base(t,'ISOLATION','BEGIN',undefined,'ENVELOPE_DIGEST_MISMATCH'),
+      base(t,'ISOLATION','END',undefined,'ENVELOPE_DIGEST_MISMATCH'),
+      base(t,'AUDIT',undefined,undefined,'ENVELOPE_DIGEST_MISMATCH','a2')]);
+  }
+  if(name==='takeover'){
+    $('ev-chain').value='scn-'+t;
+    return postBatch([base(t,'TAKEOVER','BEGIN',undefined,'OWNERSHIP_LOST'),
+      base(t,'TAKEOVER','END',undefined,'TAKEOVER_COMPLETE'),
+      base(t,'AUDIT',undefined,undefined,'OWNERSHIP_LOST','a3')]);
+  }
+  if(name==='watermark-gap'){
+    // 显式 seq：1,3 先到（2 缺失，水位停在 1 且 3 不触发）；再补 2 后连续放行
+    $('ev-chain').value='scn-'+t;
+    return postBatch([
+      {event_id:'wg-'+t+'-1',tenant:'tenant-a',event_type:'GAP',role:'BEGIN',chain_id:'scn-'+t,reason:'SEGMENT_INDEX_MISMATCH',seq:1},
+      {event_id:'wg-'+t+'-3',tenant:'tenant-a',event_type:'GAP',role:'END',chain_id:'scn-'+t+'-b',reason:'SEGMENT_INDEX_MISMATCH',seq:3},
+    ]).then(()=>setTimeout(()=>postBatch([
+      {event_id:'wg-'+t+'-2',tenant:'tenant-a',event_type:'AUDIT',role:'WITNESS',chain_id:'scn-'+t,reason:'SEGMENT_INDEX_MISMATCH',audit_ref:'wg2',seq:2},
+    ]), 600));
+  }
+  if(name==='dedup'){
+    $('ev-chain').value='scn-'+t;
+    // 同一 reason 指纹、不同 chain，连续两次完整隔离链：第二次应被滑动窗口抑制
+    return postBatch([base(t,'ISOLATION','BEGIN',undefined,'BODY_CONFLICT'),
+      base(t,'AUDIT',undefined,undefined,'BODY_CONFLICT','d1'),
+      base(t+'-2','ISOLATION','BEGIN',undefined,'BODY_CONFLICT'),
+      base(t+'-2','AUDIT',undefined,undefined,'BODY_CONFLICT','d2')]);
+  }
+}
+
+async function createSilence(){
+  try {
+    const r = await jpost('/api/silences', {
+      tenant:$('sl-tenant').value,
+      alert_type:$('sl-type').value || undefined,
+      reason:$('sl-reason').value || undefined,
+      ttl_seconds:$('sl-ttl').value?Number($('sl-ttl').value):undefined,
+      note:$('sl-note').value, silence_existing:true,
+    });
+    toast('静默规则已创建 '+r.id); loadAll();
+  } catch(e){ toast(e.message, true); }
+}
+
+async function loadWatermarks(){
+  const {tenants} = await api('/api/watermarks');
+  $('watermarks').innerHTML = Object.entries(tenants).map(([t,w])=>`<tr>
+    <td>${esc(t)}</td><td>${w.contiguous_until}</td><td>${w.max_seen_seq}</td>
+    <td>${w.pending_events}</td>
+    <td>${w.watermark_contiguous?'<span class="ok">连续</span>':'<span class="bad">有缺口</span>'}</td>
+  </tr>`).join('') || '<tr><td colspan="5" class="muted">无</td></tr>';
+}
+async function loadGaps(){
+  const {gaps} = await api('/api/gaps?include_filled=1');
+  $('gaps').innerHTML = gaps.map(g=>`<tr>
+    <td>${esc(g.tenant)}</td><td>≥ ${g.gap_from}</td><td>${fmt(g.detected_at)}</td>
+    <td>${g.filled_at?('<span class="ok">'+fmt(g.filled_at)+'</span>'):'<span class="bad">开放中</span>'}</td>
+  </tr>`).join('') || '<tr><td colspan="4" class="muted">无</td></tr>';
+}
+async function loadChains(){
+  const {chains} = await api('/api/chains?limit=100');
+  $('chains').innerHTML = chains.map(c=>`<tr>
+    <td>${esc(c.chain_id)}</td><td>${esc(c.tenant)}</td>
+    <td>${c.event_type||'<span class="muted">?</span>'}</td>
+    <td><span class="badge s-${c.status}">${c.status}</span></td>
+    <td>${c.saw_begin?1:0}/${c.saw_end?1:0}/${c.witnesses}</td>
+    <td>${c.alert_id?esc(c.alert_id):'—'}</td></tr>`).join('')
+    || '<tr><td colspan="6" class="muted">无</td></tr>';
+}
+async function loadAudit(){
+  const {entries} = await api('/api/audit?limit=40');
+  $('audit').innerHTML = entries.map(e=>`<tr>
+    <td>${e.id}</td><td>${fmt(e.at)}</td><td class="kind">${e.kind}</td>
+    <td><pre>${esc(JSON.stringify(e.detail))}</pre></td></tr>`).join('')
+    || '<tr><td colspan="4" class="muted">无</td></tr>';
+}
+async function loadSilences(){
+  const {rules} = await api('/api/silences');
+  $('silences').innerHTML = rules.map(r=>`<tr>
+    <td>${r.id}</td><td>${esc(r.tenant)}</td>
+    <td>${r.alert_type||'*'}</td><td>${esc(r.reason||'*')}</td>
+    <td>${r.expires_at?fmt(r.expires_at):'永久'}</td><td>${esc(r.note)}</td>
+    <td><button class="danger" onclick="delRule('${r.id}')">删除并恢复</button></td></tr>`).join('')
+    || '<tr><td colspan="7" class="muted">无</td></tr>';
+}
+async function delRule(id){
+  try { const r = await jdel('/api/silences/'+id);
+    toast('规则已删除，恢复告警 '+r.restored_alerts.length+' 条'); loadAll(); }
+  catch(e){ toast(e.message,true); }
+}
+async function pollOnce(){
+  try { const r = await jpost('/ops/subscriber/poll',{});
+    toast('订阅一轮：新增审计 '+r.new_audit_entries+'，事件 '+r.events_sent); loadAll(); }
+  catch(e){ toast(e.message,true); }
+}
+async function sweep(){
+  try { const r = await jpost('/ops/sweep',{});
+    toast('sweep：恢复静默 '+r.silences_restored+'，清扫窗口 '+r.windows_pruned); loadAll(); }
+  catch(e){ toast(e.message,true); }
+}
+
+async function loadAll(){
+  try {
+    await Promise.all([loadStatus(),loadAlerts(),loadWatermarks(),loadGaps(),
+      loadChains(),loadAudit(),loadSilences()]);
+  } catch(e){ $('st-sub').textContent = '加载失败: '+e.message; }
+}
+loadAll();
+setInterval(()=>{ if($('auto').checked) loadAll(); }, 3000);
+</script>
+</body>
+</html>
