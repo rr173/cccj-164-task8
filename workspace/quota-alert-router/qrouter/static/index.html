@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>配额灾备异常告警路由器</title>
+<style>
+  :root {
+    --bg:#0f1420; --panel:#171e2e; --panel2:#1d263a; --line:#2a3550;
+    --txt:#d7e0f2; --dim:#8a97b5; --accent:#5b8cff;
+    --crit:#ff5d6c; --warn:#ffb347; --ok:#3ddc97; --info:#56b6ff;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt);
+         font:13px/1.5 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",monospace; }
+  header { padding:14px 20px; border-bottom:1px solid var(--line);
+           display:flex; align-items:center; gap:16px; flex-wrap:wrap; background:var(--panel); }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  header .sub { color:var(--dim); font-size:12px; }
+  .stat { display:flex; gap:8px; flex-wrap:wrap; margin-left:auto; }
+  .chip { background:var(--panel2); border:1px solid var(--line); border-radius:6px;
+          padding:4px 10px; font-size:12px; }
+  .chip b { font-size:14px; margin-left:4px; }
+  main { padding:16px 20px; display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px;
+          overflow:hidden; }
+  .card.wide { grid-column:1 / -1; }
+  .card h2 { margin:0; padding:10px 14px; font-size:13px; border-bottom:1px solid var(--line);
+             display:flex; align-items:center; gap:10px; background:var(--panel2); }
+  .card h2 .grow { flex:1; }
+  .card .body { max-height:340px; overflow:auto; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th,td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line);
+          vertical-align:top; white-space:nowrap; }
+  th { color:var(--dim); font-weight:500; position:sticky; top:0; background:var(--panel2); }
+  td.wrap, th.wrap { white-space:normal; }
+  tr:hover td { background:#1b2438; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; font-weight:600; }
+  .s-OPEN { background:rgba(255,93,108,.16); color:var(--crit); }
+  .s-ACKED { background:rgba(255,179,71,.16); color:var(--warn); }
+  .s-RECOVERED { background:rgba(86,182,255,.16); color:var(--info); }
+  .s-SILENCED { background:rgba(138,151,181,.18); color:var(--dim); }
+  .s-CLOSED { background:rgba(61,220,151,.14); color:var(--ok); }
+  .t-QUARANTINE { color:var(--crit); } .t-GAP { color:var(--warn); }
+  .t-TAKEOVER { color:var(--info); } .t-AUDIT { color:#b48cff; }
+  button { background:var(--panel2); color:var(--txt); border:1px solid var(--line);
+           border-radius:5px; padding:3px 9px; font-size:11px; cursor:pointer; }
+  button:hover { border-color:var(--accent); color:#fff; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.danger { color:var(--crit); } button:disabled { opacity:.4; cursor:default; }
+  select,input { background:var(--bg); color:var(--txt); border:1px solid var(--line);
+                 border-radius:5px; padding:3px 7px; font-size:12px; }
+  .row-actions { display:flex; gap:5px; }
+  .muted { color:var(--dim); }
+  .ok { color:var(--ok); } .bad { color:var(--crit); } .warn { color:var(--warn); }
+  #toast { position:fixed; bottom:18px; right:18px; display:flex; flex-direction:column; gap:8px; z-index:9; }
+  .toast { background:var(--panel2); border:1px solid var(--line); border-left:3px solid var(--accent);
+           padding:8px 14px; border-radius:6px; max-width:420px; }
+  .toast.err { border-left-color:var(--crit); } .toast.ok { border-left-color:var(--ok); }
+  dialog { background:var(--panel); color:var(--txt); border:1px solid var(--line);
+           border-radius:10px; padding:18px; width:min(640px,92vw); }
+  dialog::backdrop { background:rgba(0,0,0,.6); }
+  pre { background:var(--bg); border:1px solid var(--line); border-radius:6px;
+        padding:10px; overflow:auto; max-height:360px; font-size:11px; }
+  .filters { display:flex; gap:8px; align-items:center; }
+  .legend { font-size:11px; color:var(--dim); }
+  code { color:#9fc1ff; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>🚨 配额灾备异常告警路由器</h1>
+    <div class="sub">连续水位准入 · 两阶段事件链 · 滑动窗口去重 · 确认/恢复 CAS · journal 重放恢复</div>
+  </div>
+  <div class="stat" id="stats"></div>
+  <div class="filters">
+    <label class="legend">租户 <select id="f-tenant"><option value="">全部</option></select></label>
+    <label class="legend">状态
+      <select id="f-status">
+        <option value="">活动+全部</option>
+        <option value="OPEN">OPEN</option><option value="ACKED">ACKED</option>
+        <option value="RECOVERED">RECOVERED</option><option value="SILENCED">SILENCED</option>
+        <option value="CLOSED">CLOSED</option>
+      </select></label>
+    <button id="btn-refresh">刷新</button>
+    <label class="legend"><input type="checkbox" id="auto" checked> 自动 3s</label>
+  </div>
+</header>
+
+<main>
+  <section class="card wide">
+    <h2>告警（按 租户 × 事件类型 × 事件链 聚合）
+      <span class="grow"></span>
+      <button onclick="openSilence()">＋ 静默规则</button>
+    </h2>
+    <div class="body">
+      <table>
+        <thead><tr>
+          <th>状态</th><th>租户</th><th>类型</th><th class="wrap">摘要 / 链</th>
+          <th>次数</th><th>版本</th><th>更新时间</th><th>操作</th>
+        </tr></thead>
+        <tbody id="alerts"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>连续水位与挂起 <span class="grow"></span>
+      <button onclick="loadPending()">刷新</button></h2>
+    <div class="body">
+      <table>
+        <thead><tr><th>租户</th><th>水位</th><th>挂起</th><th class="wrap">缺号 / 挂起链</th></tr></thead>
+        <tbody id="watermarks"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>静默规则</h2>
+    <div class="body">
+      <table>
+        <thead><tr><th>租户</th><th>类型</th><th class="wrap">原因</th><th>到期</th><th></th></tr></thead>
+        <tbody id="silences"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card wide">
+    <h2>审计轨迹（每次状态转移一条）<span class="grow"></span>
+      <select id="f-kind">
+        <option value="">全部 kind</option>
+      </select></h2>
+    <div class="body" style="max-height:300px">
+      <table>
+        <thead><tr><th>#</th><th>时间</th><th>kind</th><th>租户</th><th>告警</th><th>操作者</th><th class="wrap">细节</th></tr></thead>
+        <tbody id="audit"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<div id="toast"></div>
+
+<dialog id="dlg">
+  <h3 id="dlg-title" style="margin:0 0 12px"></h3>
+  <div id="dlg-body"></div>
+  <div style="text-align:right;margin-top:14px;display:flex;gap:8px;justify-content:flex-end">
+    <button onclick="dlg.close()">关闭</button>
+    <button class="primary" id="dlg-ok" style="display:none"></button>
+  </div>
+</dialog>
+
+<script>
+const dlg = document.getElementById('dlg');
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmt = t => t ? esc(t).replace('T',' ').replace('Z','') : '';
+
+function toast(msg, ok=true) {
+  const el = document.createElement('div');
+  el.className = 'toast ' + (ok ? 'ok' : 'err');
+  el.textContent = msg;
+  document.getElementById('toast').appendChild(el);
+  setTimeout(() => el.remove(), 4000);
+}
+
+async function api(path, opts={}) {
+  const resp = await fetch(path, {headers:{'Content-Type':'application/json'}, ...opts});
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw Object.assign(new Error(data.message || resp.statusText), {data});
+  return data;
+}
+
+async function act(path, body) {
+  try {
+    const r = await api(path, {method:'POST', body: JSON.stringify(body || {})});
+    toast('操作成功：' + path);
+    await refresh();
+    return r;
+  } catch (e) {
+    const detail = e.data ? (e.data.error + ' — ' + e.data.message) : e.message;
+    toast('操作失败：' + detail, false);
+    if (e.data && e.data.error === 'ALERT_VERSION_CONFLICT') setTimeout(refresh, 300);
+  }
+}
+
+let ALERTS = [];
+
+async function loadStats() {
+  const s = await api('/api/stats');
+  const labels = {open:'OPEN', acked:'ACKED', recovered:'RECOVERED',
+                  silenced:'SILENCED', closed:'CLOSED'};
+  document.getElementById('stats').innerHTML =
+    Object.entries(labels).map(([k,v]) =>
+      `<span class="chip s-${v}">${v}<b>${s.alerts[k]||0}</b></span>`).join('')
+    + `<span class="chip">journal<b>${s.journal_entries}</b></span>`
+    + `<span class="chip ${s.held_events?'bad':''}">挂起<b>${s.held_events}</b></span>`
+    + `<span class="chip ${s.stream_gaps?'warn':''}">缺口<b>${s.stream_gaps}</b></span>`
+    + `<span class="chip muted">jseq ${s.max_jseq}</span>`;
+}
+
+async function loadAlerts() {
+  const tenant = document.getElementById('f-tenant').value;
+  const status = document.getElementById('f-status').value;
+  const q = new URLSearchParams();
+  if (tenant) q.set('tenant', tenant);
+  if (status) q.set('status', status);
+  if (!status) q.set('limit', '200');
+  const {alerts} = await api('/api/alerts?' + q.toString());
+  ALERTS = alerts;
+  const known = new Set([...document.querySelectorAll('#f-tenant option')].map(o=>o.value));
+  [...new Set(alerts.map(a=>a.tenant))].forEach(t => {
+    if (!known.has(t)) {
+      const o = document.createElement('option'); o.value=t; o.textContent=t;
+      document.getElementById('f-tenant').appendChild(o);
+    }
+  });
+  document.getElementById('alerts').innerHTML = alerts.map(a => {
+    const acts = [];
+    if (a.status === 'OPEN') acts.push(`<button onclick="doAck('${a.alert_id}',${a.version})">确认</button>`);
+    if (['OPEN','ACKED'].includes(a.status)) {
+      acts.push(`<button onclick="doRecover('${a.alert_id}',${a.version})">恢复</button>`);
+      acts.push(`<button onclick="doSilenceAlert('${a.alert_id}')">静默</button>`);
+    }
+    if (a.status === 'SILENCED') acts.push(`<button onclick="act('/api/alerts/${a.alert_id}/unsilence',{})">解除静默</button>`);
+    if (a.status === 'RECOVERED') acts.push(`<button onclick="act('/api/alerts/${a.alert_id}/close',{})">关闭</button>`);
+    if (a.status !== 'CLOSED') acts.push(`<button class="danger" onclick="act('/api/alerts/${a.alert_id}/close',{})">强制关闭</button>`);
+    acts.push(`<button onclick="showDetail('${a.alert_id}')">详情</button>`);
+    const bf = a.backfilled ? ' <span class="badge s-RECOVERED">补发</span>' : '';
+    return `<tr>
+      <td><span class="badge s-${a.status}">${a.status}</span>${bf}</td>
+      <td>${esc(a.tenant)}</td>
+      <td class="t-${a.type}">${a.type}</td>
+      <td class="wrap">${esc(a.summary)}<div class="muted">chain: <code>${esc(a.chain_id)}</code></div></td>
+      <td>${a.occurrence_count}</td>
+      <td class="muted">v${a.version}</td>
+      <td class="muted">${fmt(a.updated_at)}</td>
+      <td><div class="row-actions">${acts.join('')}</div></td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="8" class="muted" style="padding:20px;text-align:center">（无告警）</td></tr>';
+}
+
+async function doAck(id, version) {
+  const actor = prompt('确认人（operator）：', 'ops-oncall');
+  if (actor === null) return;
+  act(`/api/alerts/${id}/ack?version=${version}`, {actor});
+}
+async function doRecover(id, version) {
+  const reason = prompt('恢复原因：', '上游异常已消除');
+  if (reason === null) return;
+  act(`/api/alerts/${id}/recover?version=${version}`, {reason});
+}
+async function doSilenceAlert(id) {
+  const mins = prompt('静默时长（分钟，留空=持续到撤销）：', '30');
+  if (mins === null) return;
+  const reason = prompt('静默原因：', '运维窗口');
+  if (reason === null) return;
+  const body = {reason};
+  if (mins) {
+    body.ends_at = new Date(Date.now() + parseFloat(mins)*60000).toISOString();
+  }
+  act(`/api/alerts/${id}/silence`, body);
+}
+
+async function showDetail(id) {
+  const d = await api('/api/alerts/' + id);
+  document.getElementById('dlg-title').textContent = '告警详情 ' + id;
+  document.getElementById('dlg-body').innerHTML =
+    `<pre>${esc(JSON.stringify(d.alert, null, 2))}</pre>
+     <h4 style="margin:10px 0 4px">事件链（${d.events.length}）</h4><pre>${esc(JSON.stringify(d.events, null, 2))}</pre>
+     <h4 style="margin:10px 0 4px">通知（${d.notifications.length}）</h4><pre>${esc(JSON.stringify(d.notifications, null, 2))}</pre>`;
+  document.getElementById('dlg-ok').style.display = 'none';
+  dlg.showModal();
+}
+
+function openSilence() {
+  document.getElementById('dlg-title').textContent = '新建静默规则';
+  document.getElementById('dlg-body').innerHTML = `
+    <table>
+      <tr><td class="muted">租户（留空=全局）</td><td><input id="s-tenant" placeholder="t-a"></td></tr>
+      <tr><td class="muted">事件类型（留空=全部）</td>
+        <td><select id="s-type"><option value="">全部</option>
+          <option>QUARANTINE</option><option>TAKEOVER</option>
+          <option>GAP</option><option>AUDIT</option></select></td></tr>
+      <tr><td class="muted">时长分钟（留空=永久）</td><td><input id="s-mins" placeholder="60"></td></tr>
+      <tr><td class="muted">原因</td><td><input id="s-reason" value="计划运维窗口"></td></tr>
+    </table>`;
+  const ok = document.getElementById('dlg-ok');
+  ok.style.display = ''; ok.textContent = '创建';
+  ok.onclick = async () => {
+    const body = {reason: document.getElementById('s-reason').value};
+    const t = document.getElementById('s-tenant').value.trim();
+    const ty = document.getElementById('s-type').value;
+    const mins = document.getElementById('s-mins').value.trim();
+    if (t) body.tenant = t;
+    if (ty) body.type = ty;
+    if (mins) body.ends_at = new Date(Date.now()+parseFloat(mins)*60000).toISOString();
+    try {
+      await api('/api/silences', {method:'POST', body: JSON.stringify(body)});
+      toast('静默规则已创建（命中的活动告警立即静默）');
+      dlg.close(); refresh();
+    } catch (e) { toast('失败：' + (e.data?.message || e), false); }
+  };
+  dlg.showModal();
+}
+
+async function loadWatermarks() {
+  const [{tenants:wms}, pending] = await Promise.all([
+    api('/api/watermarks'), api('/api/pending')]);
+  const pm = Object.fromEntries(pending.tenants.map(t => [t.tenant, t]));
+  document.getElementById('watermarks').innerHTML = wms.map(w => {
+    const p = pm[w.tenant];
+    const missing = p ? (p.missing_seqs.length
+        ? `<span class="bad">缺号 ${p.missing_seqs.join(',')}</span>`
+        : '<span class="ok">连续</span>') : '<span class="ok">连续</span>';
+    const chains = p && p.held_chains.length
+        ? `<div class="muted">挂起链: ${p.held_chains.map(esc).join(', ')}</div>` : '';
+    return `<tr><td>${esc(w.tenant)}</td>
+      <td>${w.watermark} <span class="muted">(next ${w.next_seq})</span></td>
+      <td class="${w.held_count?'warn':''}">${w.held_count}</td>
+      <td class="wrap">${missing}${chains}</td></tr>`;
+  }).join('') || '<tr><td colspan="4" class="muted" style="padding:16px;text-align:center">（尚无租户）</td></tr>';
+}
+
+async function loadSilences() {
+  const {silences} = await api('/api/silences?include_revoked=1');
+  document.getElementById('silences').innerHTML = silences.map(s => {
+    const revoked = s.revoked_at ? `<span class="badge s-CLOSED">已撤销</span>` : '';
+    return `<tr>
+      <td>${esc(s.tenant || '全局')}${revoked}</td>
+      <td>${esc(s.type || '全部')}</td>
+      <td class="wrap">${esc(s.reason)}<div class="muted">${esc(s.silence_id)}</div></td>
+      <td class="muted">${s.ends_at ? fmt(s.ends_at) : '永久'}</td>
+      <td>${s.revoked_at ? '' : `<button onclick="revokeSilence('${s.silence_id}')">撤销</button>`}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="5" class="muted" style="padding:16px;text-align:center">（无静默规则）</td></tr>';
+}
+async function revokeSilence(id) {
+  await act(`/api/silences/${id}/revoke`, {});
+}
+
+const KNOWN_KINDS = ['alert_fired','alert_deduped','alert_acked','alert_recovered',
+  'alert_closed','alert_silenced','alert_unsilenced','alert_reopened',
+  'stream_gap','watermark_advance','chain_held','chain_pending_closed',
+  'silence_created','silence_revoked','silence_expired',
+  'recovered_ttl_closed','recovery_ignored'];
+async function loadAuditKinds() {
+  const sel = document.getElementById('f-kind');
+  if (sel.options.length > 1) return;
+  KNOWN_KINDS.forEach(k => {
+    const o = document.createElement('option'); o.value=k; o.textContent=k;
+    sel.appendChild(o);
+  });
+}
+async function loadAudit() {
+  const kind = document.getElementById('f-kind').value;
+  const {entries} = await api('/api/audit?limit=80' + (kind ? '&kind='+kind : ''));
+  document.getElementById('audit').innerHTML = entries.map(e => `
+    <tr><td>${e.id}</td><td class="muted">${fmt(e.at)}</td>
+      <td><b>${esc(e.kind)}</b></td><td>${esc(e.tenant||'')}</td>
+      <td class="muted">${e.alert_id ? '<code>'+esc(e.alert_id.slice(0,14))+'…</code>' : ''}</td>
+      <td class="muted">${esc(e.actor)}</td>
+      <td class="wrap muted">${esc(e.detail_json)}</td></tr>`).join('')
+    || '<tr><td colspan="7" class="muted" style="padding:16px;text-align:center">（无审计）</td></tr>';
+}
+
+async function refresh() {
+  try {
+    await Promise.all([loadStats(), loadAlerts(), loadWatermarks(),
+                       loadSilences(), loadAuditKinds()]);
+    await loadAudit();
+  } catch (e) { /* 轮询失败静默，等下一轮 */ }
+}
+document.getElementById('btn-refresh').onclick = refresh;
+document.getElementById('f-tenant').onchange = loadAlerts;
+document.getElementById('f-status').onchange = loadAlerts;
+document.getElementById('f-kind').onchange = loadAudit;
+refresh();
+setInterval(() => { if (document.getElementById('auto').checked) refresh(); }, 3000);
+</script>
+</body>
+</html>
